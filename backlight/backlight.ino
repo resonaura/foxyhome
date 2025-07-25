@@ -1,10 +1,11 @@
 /**************************************************************
  * ESP8266 (NodeMCU) + Adafruit_NeoPixel (СТАТИКА) + WS2812FX (ЭФФЕКТЫ)
  * + SinricPro + Async HTTP server
- * - Плавные переходы (blocking for + delay) для статики
+ * - Плавные переходы (blocking for + delay) для статики и для эффекта (по яркости)
+ * - Очередь событий обрабатывается и внутри фейдов (так что Sinric не «теряется»)
  * - /state (GET/POST)
- * - /effects (GET) — фикс
- * - Старт: белый 255,255,255 с плавным включением
+ * - /effects (GET)
+ * - При on/off через Sinric эффект НЕ сбрасывается: просто гасим / поднимаем яркость
  **************************************************************/
 
 #include <Arduino.h>
@@ -44,6 +45,7 @@ AsyncWebServer server(80);
 
 // ---------- Очередь событий ----------
 std::queue<std::function<void()>> eventQueue;
+volatile bool executingEvent = false;   // защитимся от ре-энтри при обработке очереди внутри фейдов
 
 // ---------- Типы ----------
 struct ColorRGB { uint8_t r, g, b; };
@@ -58,6 +60,7 @@ struct DeviceState {
   int colorTemperature = 2700;     // K
   EffectMode effectMode = EffectMode::STATIC;
 
+  // для эффекта
   uint8_t  ws2812fxMode  = FX_MODE_FIRE_FLICKER_SOFT;
   uint16_t ws2812fxSpeed = 1000;
 
@@ -96,9 +99,13 @@ ColorRGB kelvinToRGB(int kelvin) {
   return { (uint8_t)r, (uint8_t)g, (uint8_t)b };
 }
 
+void processEventQueue(); // forward
+
 inline void serviceEverything() {
   fx.service();          // если эффект запущен — пусть живёт
   SinricPro.handle();    // чтобы синрик не отваливался
+  if (!executingEvent)   // обработаем новые события, если они прилетели
+    processEventQueue();
   delay(1);
   yield();
 }
@@ -113,8 +120,7 @@ void applyStaticInstant(ColorRGB c, int brightnessPercentage) {
 }
 
 // --- эффект ON/OFF ---
-void enableEffect(uint8_t mode, uint16_t speed) {
-  // глушим статический рендер (strip ничего “не крутит”, но гасим)
+void enableEffect(uint8_t mode, uint16_t speed, int startBrightness /*0..100*/) {
   strip.setBrightness(0);
   strip.show();
 
@@ -123,8 +129,14 @@ void enableEffect(uint8_t mode, uint16_t speed) {
   fx.setMode(mode);
   fx.setSpeed(speed);
   fx.setColor(strip.Color(device_state.color.r, device_state.color.g, device_state.color.b));
-  fx.setBrightness(map(device_state.brightness, 0, 100, 0, 255));
+  fx.setBrightness(map(startBrightness, 0, 100, 0, 255));
   fx.start();
+}
+
+void resumeEffectIfNeeded(int startBrightness /*0..100*/) {
+  if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+    enableEffect(device_state.ws2812fxMode, device_state.ws2812fxSpeed, startBrightness);
+  }
 }
 
 void disableEffectToStatic() {
@@ -142,13 +154,15 @@ void ensureRendererForCurrentMode() {
   }
 
   if (device_state.effectMode == EffectMode::STATIC) {
-    disableEffectToStatic(); // гарантированно в статике
+    disableEffectToStatic();
   } else {
-    enableEffect(device_state.ws2812fxMode, device_state.ws2812fxSpeed);
+    resumeEffectIfNeeded(device_state.brightness);
   }
 }
 
-// ====== Плавные переходы для статики ======
+// ====== Плавные переходы ======
+
+// статика — как раньше
 void smoothTransitionToColor(ColorRGB targetColor, int brightnessPercentage, int steps = FADE_STEPS, int stepDelay = FADE_STEP_MS) {
   ColorRGB currentColor = device_state.color;
   for (int step = 0; step <= steps; step++) {
@@ -157,9 +171,7 @@ void smoothTransitionToColor(ColorRGB targetColor, int brightnessPercentage, int
       (uint8_t)(currentColor.g + ((targetColor.g - currentColor.g) * step) / steps),
       (uint8_t)(currentColor.b + ((targetColor.b - currentColor.b) * step) / steps)
     };
-
     applyStaticInstant(cur, brightnessPercentage);
-
     uint32_t start = millis();
     while (millis() - start < (uint32_t)stepDelay) serviceEverything();
   }
@@ -170,6 +182,19 @@ void smoothTransitionToBrightness(int startBrightness, int targetBrightness, int
   for (int step = 0; step <= steps; step++) {
     int br = startBrightness + ((targetBrightness - startBrightness) * step) / steps;
     applyStaticInstant(device_state.color, br);
+    uint32_t start = millis();
+    while (millis() - start < (uint32_t)stepDelay) serviceEverything();
+  }
+  device_state.brightness = targetBrightness;
+}
+
+// эффект — только яркость (чтобы не гасить эффект)
+void smoothEffectBrightness(int startBrightness, int targetBrightness, int steps = FADE_STEPS, int stepDelay = FADE_STEP_MS) {
+  int from = startBrightness, to = targetBrightness;
+  for (int step = 0; step <= steps; step++) {
+    int br = from + ((to - from) * step) / steps;
+    fx.setBrightness(map(br, 0, 100, 0, 255));
+    fx.service();
     uint32_t start = millis();
     while (millis() - start < (uint32_t)stepDelay) serviceEverything();
   }
@@ -207,10 +232,13 @@ void sendStateToSinricIfChanged() {
 
 // ================== Очередь ==================
 void processEventQueue() {
-  if (!eventQueue.empty()) {
+  if (executingEvent) return;
+  while (!eventQueue.empty()) {
+    executingEvent = true;
     auto fn = eventQueue.front();
     eventQueue.pop();
     fn();
+    executingEvent = false;
   }
 }
 
@@ -223,21 +251,28 @@ bool onPowerState(const String &deviceId, bool &state) {
     if (target == device_state.power) return;
 
     if (target) {
+      // ВКЛЮЧЕНИЕ
       device_state.power = true;
-      // всегда включаемся в статике с плавным fade-in
-      disableEffectToStatic();
-      smoothTransitionToBrightness(0, device_state.brightness);
-    } else {
-      // выключаем: плавно brightness -> 0, затем гасим всё
       if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
-        fx.stop();
-        applyStaticInstant(device_state.color, device_state.brightness);
+        // восстановить эффект с яркости 0 -> target
+        resumeEffectIfNeeded(0);
+        smoothEffectBrightness(0, device_state.brightness);
+      } else {
+        disableEffectToStatic(); // статический
+        smoothTransitionToBrightness(0, device_state.brightness);
       }
-      smoothTransitionToBrightness(device_state.brightness, 0);
+    } else {
+      // ВЫКЛЮЧЕНИЕ
+      if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+        // просто угасаем по яркости и стопаем
+        smoothEffectBrightness(device_state.brightness, 0);
+        fx.stop();
+      } else {
+        smoothTransitionToBrightness(device_state.brightness, 0);
+      }
       device_state.power = false;
       strip.setBrightness(0);
       strip.show();
-      fx.stop();
     }
 
     sendStateToSinricIfChanged();
@@ -254,10 +289,11 @@ bool onBrightness(const String &deviceId, int &brightness) {
       device_state.brightness = target;
     } else {
       if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
-        // при команде яркости из Sinric — вырубаем эффект и делаем плавно статику
-        disableEffectToStatic();
+        // НЕ выключаем эффект — просто плавно меняем его яркость
+        smoothEffectBrightness(device_state.brightness, target);
+      } else {
+        smoothTransitionToBrightness(device_state.brightness, target);
       }
-      smoothTransitionToBrightness(device_state.brightness, target);
     }
 
     sendStateToSinricIfChanged();
@@ -270,8 +306,10 @@ bool onColor(const String &deviceId, byte &r, byte &g, byte &b) {
   eventQueue.push([=](){
     device_state.lastSource = Source::SINRIC;
 
+    // Цвет — это про статику. Если был эффект — выключаем его.
     if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
-      disableEffectToStatic();
+      fx.stop();
+      device_state.effectMode = EffectMode::STATIC;
     }
 
     if (device_state.power) {
@@ -291,7 +329,8 @@ bool onColorTemperature(const String &deviceId, int &colorTemperature) {
     device_state.lastSource = Source::SINRIC;
 
     if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
-      disableEffectToStatic();
+      fx.stop();
+      device_state.effectMode = EffectMode::STATIC;
     }
 
     ColorRGB targetColor = kelvinToRGB(targetCt);
@@ -338,8 +377,7 @@ void httpRespondState(AsyncWebServerRequest *request) {
 
 void patchStateDeferred(const JsonVariantConst &root) {
   DeviceState newState = device_state;
-
-  bool wantEffect = false;
+  bool effectCmd = false;
 
   if (root.containsKey("power")) {
     newState.power = root["power"].as<bool>();
@@ -368,8 +406,9 @@ void patchStateDeferred(const JsonVariantConst &root) {
 
   if (root.containsKey("effect")) {
     auto e = root["effect"];
-    wantEffect = e["enabled"] | false;
-    if (wantEffect) {
+    effectCmd = true;
+    bool enabled = e["enabled"] | false;
+    if (enabled) {
       newState.effectMode = EffectMode::WS2812FX_MODE;
       if (e.containsKey("mode"))  newState.ws2812fxMode = e["mode"].as<uint8_t>();
       if (e.containsKey("speed")) newState.ws2812fxSpeed = e["speed"].as<uint16_t>();
@@ -385,31 +424,40 @@ void patchStateDeferred(const JsonVariantConst &root) {
     device_state = newState;
 
     if (!from.power && newState.power) {
-      // включаемся: если сразу эффект — просто включаем эффект,
-      // иначе — плавно статику
+      // ON
       if (newState.effectMode == EffectMode::WS2812FX_MODE) {
-        enableEffect(newState.ws2812fxMode, newState.ws2812fxSpeed);
+        resumeEffectIfNeeded(0);
+        smoothEffectBrightness(0, newState.brightness);
       } else {
         disableEffectToStatic();
         smoothTransitionToBrightness(0, newState.brightness);
         smoothTransitionToColor(newState.color, newState.brightness);
       }
     } else if (from.power && !newState.power) {
-      // выключаем: плавно гасим
+      // OFF
       if (from.effectMode == EffectMode::WS2812FX_MODE) {
+        smoothEffectBrightness(from.brightness, 0);
         fx.stop();
-        applyStaticInstant(from.color, from.brightness);
+      } else {
+        smoothTransitionToBrightness(from.brightness, 0);
       }
-      smoothTransitionToBrightness(from.brightness, 0);
       strip.setBrightness(0);
       strip.show();
-      fx.stop();
     } else {
-      // оба включены
+      // ON -> ON
       if (newState.effectMode == EffectMode::WS2812FX_MODE) {
-        enableEffect(newState.ws2812fxMode, newState.ws2812fxSpeed);
+        // врубаем эффект, НЕ выключая его при power toggle
+        resumeEffectIfNeeded(device_state.brightness);
+        if (effectCmd) {
+          // скорость или режим могли поменяться — применим сразу
+          fx.setMode(device_state.ws2812fxMode);
+          fx.setSpeed(device_state.ws2812fxSpeed);
+        }
+        // если brightness меняли — плавно в эффекте
+        if (from.brightness != newState.brightness)
+          smoothEffectBrightness(from.brightness, newState.brightness);
       } else {
-        // статический плавный переход
+        // статика
         disableEffectToStatic();
         if (from.brightness != newState.brightness)
           smoothTransitionToBrightness(from.brightness, newState.brightness);
@@ -470,12 +518,11 @@ void setupHttp() {
   // GET /effects  -> список всех эффектов
   server.on("/effects", HTTP_GET, [](AsyncWebServerRequest *request){
     AsyncResponseStream *response = request->beginResponseStream("application/json");
-
     uint8_t count = fx.getModeCount();
     response->print("{\"effects\":[");
 
     for (uint8_t i = 0; i < count; i++) {
-      char name[48];
+      char name[64];
       strncpy_P(name, (PGM_P)fx.getModeName(i), sizeof(name));
       name[sizeof(name)-1] = 0;
 
