@@ -1,197 +1,518 @@
-#include <Adafruit_NeoPixel.h>
+/**************************************************************
+ * ESP8266 (NodeMCU) + Adafruit_NeoPixel (СТАТИКА) + WS2812FX (ЭФФЕКТЫ)
+ * + SinricPro + Async HTTP server
+ * - Плавные переходы «как раньше» (blocking for + delay),
+ *   но с SinricPro.handle() / yield() внутри каждого шага
+ * - /state (GET/POST)
+ * - /effects (GET) — фикс, теперь не пустой
+ * - Старт: белый 255,255,255 с плавным включением
+ **************************************************************/
+
 #include <Arduino.h>
+#include <math.h>
 #include <functional>
 #include <queue>
-#if defined(ESP8266)
-  #include <ESP8266WiFi.h>
-#elif defined(ESP32) || defined(ARDUINO_ARCH_RP2040)
-  #include <WiFi.h>
-#endif
+
+#include <Adafruit_NeoPixel.h>
+#include <WS2812FX.h>
+
+#include <ESP8266WiFi.h>
+#include <ESPAsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <AsyncJson.h>
+#include <ArduinoJson.h>
 
 #include "SinricPro.h"
 #include "SinricProLight.h"
-#include "credentials.h" // Подключение файла с конфиденциальными данными
 
-#define LED_PIN    D4      
-#define NUM_LEDS   210     
-#define BAUD_RATE  115200                
+#include "credentials.h"   // WIFI_SSID, WIFI_PASS, APP_KEY, APP_SECRET, LIGHT_ID
 
-Adafruit_NeoPixel strip = Adafruit_NeoPixel(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+#define LED_PIN          D4
+#define NUM_LEDS         210
+#define BAUD_RATE        115200
 
+// Параметры плавности
+#define FADE_STEPS       30
+#define FADE_STEP_MS     10
+
+// ---------- Рендеры ----------
+Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);   // для статического режима
+WS2812FX fx(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);               // для эффектов
+
+// ---------- WEB ----------
+AsyncWebServer server(80);
+
+// ---------- Очередь событий ----------
 std::queue<std::function<void()>> eventQueue;
 
-struct ColorRGB {
-  byte r, g, b;
-};
+// ---------- Типы ----------
+struct ColorRGB { uint8_t r, g, b; };
 
-// Состояние устройства
-struct {
-  bool powerState = false;
-  int brightnessPercentage = 100;
-  int lastBrightnessPercentage = 100;
-  ColorRGB color = {0, 0, 0};
-  ColorRGB lastColor = {0, 0, 0};
+enum class Source { SINRIC, HTTP };
+enum class EffectMode { STATIC, WS2812FX_MODE };
+
+struct DeviceState {
+  bool power = true;
+  int brightness = 100;            // 0..100
+  ColorRGB color = {255, 255, 255};
+  int colorTemperature = 2700;     // K
+  EffectMode effectMode = EffectMode::STATIC;
+
+  uint8_t  ws2812fxMode  = FX_MODE_FIRE_FLICKER_SOFT;
+  uint16_t ws2812fxSpeed = 1000;
+
+  Source lastSource = Source::SINRIC;
+} device_state;
+
+struct LastReportedToSinric {
+  bool power = true;
+  int brightness = 100;
+  ColorRGB color = {255,255,255};
   int colorTemperature = 2700;
-} device_state; 
+} lastReported;
 
-int colorTemperatureArray[] = {2200, 2700, 4000, 5500, 7000};  
-int max_color_temperatures = sizeof(colorTemperatureArray) / sizeof(colorTemperatureArray[0]); 
-std::map<int, int> colorTemperatureIndex;
+// ==========================================================
 
-void setupColorTemperatureIndex() {
-  for (int i = 0; i < max_color_temperatures; i++) {
-    colorTemperatureIndex[colorTemperatureArray[i]] = i;
-  }
-}
+uint32_t toColor(const ColorRGB &c) { return strip.Color(c.r, c.g, c.b); }
 
 ColorRGB kelvinToRGB(int kelvin) {
-  const float temperature = kelvin / 100.0;
+  float temperature = kelvin / 100.0f;
   float r, g, b;
 
-  if (temperature <= 66) {
-    r = 255;
-    g = fmax(99.4708025861 * log(temperature) - 161.1195681661, 0);
-    b = (temperature <= 19) ? 0 : fmax(138.5177312231 * log(temperature - 10) - 305.0447927307, 0);
+  if (temperature <= 66.0f) {
+    r = 255.0f;
+    g = 99.4708025861f * log(temperature) - 161.1195681661f;
+    if (temperature <= 19.0f) b = 0.0f;
+    else                      b = 138.5177312231f * log(temperature - 10.0f) - 305.0447927307f;
   } else {
-    r = fmax(329.698727446 * pow(temperature - 60, -0.1332047592), 0);
-    g = fmax(288.1221695283 * pow(temperature - 60, -0.0755148492), 0);
-    b = 255;
+    r = 329.698727446f * pow(temperature - 60.0f, -0.1332047592f);
+    g = 288.1221695283f * pow(temperature - 60.0f, -0.0755148492f);
+    b = 255.0f;
   }
-  
-  return { byte(r), byte(g), byte(b) };
+
+  r = constrain(r, 0, 255);
+  g = constrain(g, 0, 255);
+  b = constrain(b, 0, 255);
+  return { (uint8_t)r, (uint8_t)g, (uint8_t)b };
 }
 
-void applyColorAndBrightness(ColorRGB color, int brightnessPercentage) {
-  int adjustedR = (color.r * brightnessPercentage) / 100;
-  int adjustedG = (color.g * brightnessPercentage) / 100;
-  int adjustedB = (color.b * brightnessPercentage) / 100;
+inline void serviceEverything() {
+  fx.service();          // если эффект запущен — пусть живёт
+  SinricPro.handle();    // чтобы синрик не отваливался
+  delay(1);
+  yield();
+}
 
-  for (int i = 0; i < NUM_LEDS; i++) {
-    strip.setPixelColor(i, strip.Color(adjustedR, adjustedG, adjustedB));
-  }
+void applyStaticInstant(ColorRGB c, int brightnessPercentage) {
+  uint8_t b = map(brightnessPercentage, 0, 100, 0, 255);
+  strip.setBrightness(b);
+  uint32_t col = toColor(c);
+  strip.fill(col, 0, NUM_LEDS);
   strip.show();
 }
 
-void smoothTransitionToColor(ColorRGB targetColor, int brightnessPercentage, int steps = 30, int delayTime = 10) {
+void ensureRendererForCurrentMode() {
+  if (!device_state.power) {
+    // просто погасим обе
+    strip.setBrightness(0);
+    strip.show();
+    fx.stop();
+    return;
+  }
+
+  if (device_state.effectMode == EffectMode::STATIC) {
+    fx.stop();  // эффект выключаем
+    applyStaticInstant(device_state.color, device_state.brightness);
+  } else {
+    strip.setBrightness(0);
+    strip.show();
+    fx.setMode(device_state.ws2812fxMode);
+    fx.setSpeed(device_state.ws2812fxSpeed);
+    fx.setColor(strip.Color(device_state.color.r, device_state.color.g, device_state.color.b));
+    fx.setBrightness(map(device_state.brightness, 0, 100, 0, 255));
+    fx.start();
+  }
+}
+
+// ====== Плавные переходы ======
+void smoothTransitionToColor(ColorRGB targetColor, int brightnessPercentage, int steps = FADE_STEPS, int stepDelay = FADE_STEP_MS) {
   ColorRGB currentColor = device_state.color;
   for (int step = 0; step <= steps; step++) {
-    int r = currentColor.r + ((targetColor.r - currentColor.r) * step) / steps;
-    int g = currentColor.g + ((targetColor.g - currentColor.g) * step) / steps;
-    int b = currentColor.b + ((targetColor.b - currentColor.b) * step) / steps;
+    ColorRGB cur = {
+      (uint8_t)(currentColor.r + ((targetColor.r - currentColor.r) * step) / steps),
+      (uint8_t)(currentColor.g + ((targetColor.g - currentColor.g) * step) / steps),
+      (uint8_t)(currentColor.b + ((targetColor.b - currentColor.b) * step) / steps)
+    };
 
-    applyColorAndBrightness({ byte(r), byte(g), byte(b) }, brightnessPercentage);
-    delay(delayTime);
+    applyStaticInstant(cur, brightnessPercentage);
+
+    uint32_t start = millis();
+    while (millis() - start < (uint32_t)stepDelay) serviceEverything();
   }
   device_state.color = targetColor;
 }
 
-void smoothTransitionToBrightness(int startBrightness, int targetBrightness, int steps = 30, int delayTime = 10) {
+void smoothTransitionToBrightness(int startBrightness, int targetBrightness, int steps = FADE_STEPS, int stepDelay = FADE_STEP_MS) {
   for (int step = 0; step <= steps; step++) {
-    int brightness = startBrightness + ((targetBrightness - startBrightness) * step) / steps;
-    applyColorAndBrightness(device_state.color, brightness);
-    delay(delayTime);
+    int br = startBrightness + ((targetBrightness - startBrightness) * step) / steps;
+    applyStaticInstant(device_state.color, br);
+    uint32_t start = millis();
+    while (millis() - start < (uint32_t)stepDelay) serviceEverything();
   }
-  device_state.brightnessPercentage = targetBrightness;
+  device_state.brightness = targetBrightness;
 }
 
+// ================== SinricPro ==================
+SinricProLight& light() { return SinricPro[LIGHT_ID]; }
+
+void sendStateToSinricIfChanged() {
+  auto &dev = light();
+
+  if (device_state.power != lastReported.power) {
+    dev.sendPowerStateEvent(device_state.power);
+    lastReported.power = device_state.power;
+  }
+
+  if (device_state.brightness != lastReported.brightness) {
+    dev.sendBrightnessEvent(device_state.brightness);
+    lastReported.brightness = device_state.brightness;
+  }
+
+  if (device_state.color.r != lastReported.color.r ||
+      device_state.color.g != lastReported.color.g ||
+      device_state.color.b != lastReported.color.b) {
+    dev.sendColorEvent(device_state.color.r, device_state.color.g, device_state.color.b);
+    lastReported.color = device_state.color;
+  }
+
+  if (device_state.colorTemperature != lastReported.colorTemperature) {
+    dev.sendColorTemperatureEvent(device_state.colorTemperature);
+    lastReported.colorTemperature = device_state.colorTemperature;
+  }
+}
+
+// ================== Очередь ==================
+void processEventQueue() {
+  if (!eventQueue.empty()) {
+    auto fn = eventQueue.front();
+    eventQueue.pop();
+    fn();
+  }
+}
+
+// ================== SINRIC CALLBACKS ==================
 bool onPowerState(const String &deviceId, bool &state) {
-  eventQueue.push([=]() {
-    if (state) {
-      smoothTransitionToColor(device_state.lastColor, device_state.brightnessPercentage, 30, 10);
+  bool target = state;
+  eventQueue.push([=](){
+    device_state.lastSource = Source::SINRIC;
+
+    if (target == device_state.power) return;
+
+    if (target) {
+      device_state.power = true;
+      device_state.effectMode = EffectMode::STATIC; // включаемся в статике
+      ensureRendererForCurrentMode();
+      smoothTransitionToBrightness(0, device_state.brightness);
     } else {
-      device_state.lastColor = device_state.color;
-      smoothTransitionToColor({0, 0, 0}, device_state.brightnessPercentage, 30, 10);
+      if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+        // гасим эффект через яркость fx
+        int from = device_state.brightness;
+        // руками диммить эффект не будем, просто выключим
+        fx.stop();
+        applyStaticInstant(device_state.color, from);
+        smoothTransitionToBrightness(from, 0);
+      } else {
+        smoothTransitionToBrightness(device_state.brightness, 0);
+      }
+      device_state.power = false;
+      ensureRendererForCurrentMode();
     }
-    device_state.powerState = state;
+
+    sendStateToSinricIfChanged();
   });
   return true;
 }
 
-bool onBrightness(const String &deviceId, int &brightnessPercentage) {
-  eventQueue.push([=]() {
-    int previousBrightness = device_state.brightnessPercentage;
-    device_state.brightnessPercentage = brightnessPercentage;
-    
-    if (device_state.powerState) {
-      smoothTransitionToBrightness(previousBrightness, brightnessPercentage, 30, 10);
+bool onBrightness(const String &deviceId, int &brightness) {
+  int target = constrain(brightness, 0, 100);
+  eventQueue.push([=](){
+    device_state.lastSource = Source::SINRIC;
+
+    if (!device_state.power) {
+      device_state.brightness = target;
+    } else {
+      // если эффект включён — выключаем и делаем статику, чтобы был плавный переход
+      if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+        device_state.effectMode = EffectMode::STATIC;
+        ensureRendererForCurrentMode();
+      }
+      smoothTransitionToBrightness(device_state.brightness, target);
     }
+
+    sendStateToSinricIfChanged();
   });
   return true;
 }
 
 bool onColor(const String &deviceId, byte &r, byte &g, byte &b) {
-  if (r == -1 && g == -1 && b == -1) return true;
-  eventQueue.push([=]() {
-    smoothTransitionToColor({r, g, b}, device_state.brightnessPercentage, 30, 10);
-    device_state.color = {r, g, b};
-    device_state.lastColor = device_state.color;
+  ColorRGB target = {r, g, b};
+  eventQueue.push([=](){
+    device_state.lastSource = Source::SINRIC;
+
+    // всегда в статике делаем плавные цвета
+    if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+      device_state.effectMode = EffectMode::STATIC;
+      ensureRendererForCurrentMode();
+    }
+
+    if (device_state.power) {
+      smoothTransitionToColor(target, device_state.brightness);
+    } else {
+      device_state.color = target;
+    }
+
+    sendStateToSinricIfChanged();
   });
   return true;
 }
 
 bool onColorTemperature(const String &deviceId, int &colorTemperature) {
-  eventQueue.push([=]() {
-    ColorRGB color = kelvinToRGB(colorTemperature);
-    smoothTransitionToColor(color, device_state.brightnessPercentage, 30, 10);
-    device_state.colorTemperature = colorTemperature;
-    device_state.color = color;
-    device_state.lastColor = color;
+  int targetCt = colorTemperature;
+  eventQueue.push([=](){
+    device_state.lastSource = Source::SINRIC;
+
+    if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+      device_state.effectMode = EffectMode::STATIC;
+      ensureRendererForCurrentMode();
+    }
+
+    ColorRGB targetColor = kelvinToRGB(targetCt);
+    device_state.colorTemperature = targetCt;
+
+    if (device_state.power) {
+      smoothTransitionToColor(targetColor, device_state.brightness);
+    } else {
+      device_state.color = targetColor;
+    }
+
+    sendStateToSinricIfChanged();
   });
   return true;
 }
 
-void processQueue() {
-  if (!eventQueue.empty()) {
-    eventQueue.front()();
-    eventQueue.pop();
-  }
+// ================== HTTP helpers ==================
+void jsonState(JsonDocument &doc) {
+  doc["power"]      = device_state.power;
+  doc["brightness"] = device_state.brightness;
+
+  JsonObject color  = doc.createNestedObject("color");
+  color["r"] = device_state.color.r;
+  color["g"] = device_state.color.g;
+  color["b"] = device_state.color.b;
+
+  doc["ct"] = device_state.colorTemperature;
+
+  JsonObject effect = doc.createNestedObject("effect");
+  effect["enabled"] = (device_state.effectMode == EffectMode::WS2812FX_MODE);
+  effect["mode"]    = device_state.ws2812fxMode;
+  effect["speed"]   = device_state.ws2812fxSpeed;
+
+  doc["source"] = (device_state.lastSource == Source::SINRIC) ? "SINRIC" : "HTTP";
 }
 
-void reconnectWiFi() {
-  if (WiFi.status() != WL_CONNECTED) {
-    WiFi.disconnect();
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
+void httpRespondState(AsyncWebServerRequest *request) {
+  StaticJsonDocument<768> doc;
+  jsonState(doc);
+  String out;
+  serializeJson(doc, out);
+  request->send(200, "application/json", out);
+}
 
-    while (WiFi.status() != WL_CONNECTED) {
-      delay(500);
+void patchStateDeferred(const JsonVariantConst &root) {
+  DeviceState newState = device_state;
+
+  if (root.containsKey("power")) {
+    newState.power = root["power"].as<bool>();
+  }
+
+  if (root.containsKey("brightness")) {
+    newState.brightness = constrain(root["brightness"].as<int>(), 0, 100);
+  }
+
+  if (root.containsKey("color")) {
+    auto c = root["color"];
+    newState.color = {
+      (uint8_t)c["r"].as<uint8_t>(),
+      (uint8_t)c["g"].as<uint8_t>(),
+      (uint8_t)c["b"].as<uint8_t>()
+    };
+    newState.effectMode = EffectMode::STATIC;
+  }
+
+  if (root.containsKey("ct")) {
+    int newCt = root["ct"].as<int>();
+    newState.colorTemperature = newCt;
+    newState.color = kelvinToRGB(newCt);
+    newState.effectMode = EffectMode::STATIC;
+  }
+
+  if (root.containsKey("effect")) {
+    auto e = root["effect"];
+    bool enabled = e["enabled"] | false;
+    if (enabled) {
+      newState.effectMode = EffectMode::WS2812FX_MODE;
+      if (e.containsKey("mode"))  newState.ws2812fxMode = e["mode"].as<uint8_t>();
+      if (e.containsKey("speed")) newState.ws2812fxSpeed = e["speed"].as<uint16_t>();
+    } else {
+      newState.effectMode = EffectMode::STATIC;
     }
   }
+
+  eventQueue.push([=](){
+    device_state.lastSource = Source::HTTP;
+
+    DeviceState from = device_state;
+    device_state = newState;
+
+    if (!from.power && newState.power) {
+      // включаемся плавно в статике
+      if (device_state.effectMode == EffectMode::WS2812FX_MODE) {
+        // сначала плавно включим статику, потом можешь отдельным запросом включить эффект
+        device_state.effectMode = EffectMode::STATIC;
+      }
+      ensureRendererForCurrentMode();
+      smoothTransitionToBrightness(0, newState.brightness);
+      // цвет уже зададим статически:
+      smoothTransitionToColor(newState.color, newState.brightness);
+    } else if (from.power && !newState.power) {
+      // плавно гасим
+      if (from.effectMode == EffectMode::WS2812FX_MODE) {
+        fx.stop();
+        applyStaticInstant(from.color, from.brightness);
+      }
+      smoothTransitionToBrightness(from.brightness, 0);
+      ensureRendererForCurrentMode();
+    } else {
+      // оба были включены
+      if (newState.effectMode == EffectMode::WS2812FX_MODE) {
+        // сразу эффект (без плавного перехода цвета — сам эффект анимированный)
+        ensureRendererForCurrentMode();
+      } else {
+        ensureRendererForCurrentMode();
+        if (from.brightness != newState.brightness)
+          smoothTransitionToBrightness(from.brightness, newState.brightness);
+        if (from.color.r != newState.color.r || from.color.g != newState.color.g || from.color.b != newState.color.b)
+          smoothTransitionToColor(newState.color, newState.brightness);
+      }
+    }
+
+    sendStateToSinricIfChanged();
+  });
 }
 
+// ================== WIFI / SINRIC / HTTP INIT ==================
 void setupWiFi() {
-  WiFi.begin(WIFI_SSID, WIFI_PASS); 
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
+    Serial.print(".");
   }
+  Serial.printf("\nWiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
 }
 
-void setupSinricPro() {
-  SinricProLight &myLight = SinricPro[LIGHT_ID];
+void setupSinric() {
+  SinricProLight &myLight = light();
   myLight.onPowerState(onPowerState);
   myLight.onBrightness(onBrightness);
   myLight.onColor(onColor);
   myLight.onColorTemperature(onColorTemperature);
-  
+
+  SinricPro.onConnected([](){ Serial.println("SinricPro connected"); });
+  SinricPro.onDisconnected([](){ Serial.println("SinricPro disconnected"); });
+
   SinricPro.begin(APP_KEY, APP_SECRET);
 }
 
+void setupHttp() {
+  // CORS
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Origin", "*");
+  DefaultHeaders::Instance().addHeader("Access-Control-Allow-Headers", "content-type");
+
+  // GET /state
+  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request){
+    httpRespondState(request);
+  });
+
+  // POST /state
+  auto stateHandler = new AsyncCallbackJsonWebHandler("/state",
+    [](AsyncWebServerRequest *request, JsonVariant &json){
+      const JsonVariantConst root = json.as<JsonVariantConst>();
+      patchStateDeferred(root);
+      httpRespondState(request);
+    }
+  );
+  server.addHandler(stateHandler);
+
+  // GET /effects  -> список всех эффектов (без ArduinoJson, стримом)
+  server.on("/effects", HTTP_GET, [](AsyncWebServerRequest *request){
+    AsyncResponseStream *response = request->beginResponseStream("application/json");
+
+    uint8_t count = fx.getModeCount();   // <-- не статический
+    response->print("{\"effects\":[");
+
+    for (uint8_t i = 0; i < count; i++) {
+      char name[32];
+      // getModeName(i) возвращает строку в PROGMEM (const __FlashStringHelper*)
+      strncpy_P(name, (PGM_P)fx.getModeName(i), sizeof(name));
+      name[sizeof(name)-1] = 0;
+
+      response->printf("{\"id\":%u,\"name\":\"%s\"}", i, name);
+      if (i < count - 1) response->print(",");
+    }
+
+    response->print("]}");
+    request->send(response);
+  });
+
+  // OPTIONS fallback
+  server.onNotFound([](AsyncWebServerRequest *request){
+    if (request->method() == HTTP_OPTIONS) request->send(200);
+    else request->send(404, "text/plain", "Not found");
+  });
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+// ================== SETUP / LOOP ==================
 void setup() {
   Serial.begin(BAUD_RATE);
-  setupColorTemperatureIndex();
-  setupWiFi();
-  setupSinricPro();
-  
-  strip.begin();
-  strip.setBrightness(160);
-  strip.show();
+  delay(200);
 
-  smoothTransitionToColor({255, 255, 255}, device_state.brightnessPercentage, 30, 10);
-  device_state.color = {255, 255, 255};
-  device_state.lastColor = device_state.color;
+  setupWiFi();
+  setupSinric();
+
+  strip.begin();
+  strip.show(); // гасим
+
+  fx.init();
+  fx.stop();
+
+  setupHttp();
+
+  // старт: белый и плавно включаемся
+  device_state.power = true;
+  device_state.effectMode = EffectMode::STATIC;
+  ensureRendererForCurrentMode();
+  smoothTransitionToBrightness(0, device_state.brightness); // одного фейда достаточно
+
+  Serial.println("Setup done");
 }
 
 void loop() {
-  SinricPro.handle();
-  processQueue();
-  reconnectWiFi();
+  fx.service();        // если эффект включён
+  processEventQueue(); // события
+  SinricPro.handle();  // синрик
 }
