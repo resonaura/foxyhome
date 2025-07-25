@@ -2,10 +2,11 @@
  * ESP8266 (NodeMCU) + Adafruit_NeoPixel (СТАТИКА) + WS2812FX (ЭФФЕКТЫ)
  * + SinricPro + Async HTTP server
  * - Плавные переходы (blocking for + delay) для статики и для эффекта (по яркости)
- * - Очередь событий обрабатывается и внутри фейдов (так что Sinric не «теряется»)
+ * - Очередь событий обрабатывается и внутри фейдов (Sinric не «теряется»)
  * - /state (GET/POST)
  * - /effects (GET)
  * - При on/off через Sinric эффект НЕ сбрасывается: просто гасим / поднимаем яркость
+ * - Полная повторная синхронизация состояния в Sinric после переподключения
  **************************************************************/
 
 #include <Arduino.h>
@@ -45,7 +46,7 @@ AsyncWebServer server(80);
 
 // ---------- Очередь событий ----------
 std::queue<std::function<void()>> eventQueue;
-volatile bool executingEvent = false;   // защитимся от ре-энтри при обработке очереди внутри фейдов
+volatile bool executingEvent = false;   // защита от ре-энтри при обработке очереди внутри фейдов
 
 // ---------- Типы ----------
 struct ColorRGB { uint8_t r, g, b; };
@@ -74,7 +75,14 @@ struct LastReportedToSinric {
   int colorTemperature = 2700;
 } lastReported;
 
+bool sinricConnected = false;
+bool needFullSync    = true;
+
 // ==========================================================
+
+SinricProLight& light() { return SinricPro[LIGHT_ID]; }
+void processEventQueue(); // forward
+void sendStateToSinricIfChanged(bool force = false);
 
 uint32_t toColor(const ColorRGB &c) { return strip.Color(c.r, c.g, c.b); }
 
@@ -98,8 +106,6 @@ ColorRGB kelvinToRGB(int kelvin) {
   b = constrain(b, 0, 255);
   return { (uint8_t)r, (uint8_t)g, (uint8_t)b };
 }
-
-void processEventQueue(); // forward
 
 inline void serviceEverything() {
   fx.service();          // если эффект запущен — пусть живёт
@@ -202,10 +208,26 @@ void smoothEffectBrightness(int startBrightness, int targetBrightness, int steps
 }
 
 // ================== SinricPro ==================
-SinricProLight& light() { return SinricPro[LIGHT_ID]; }
 
-void sendStateToSinricIfChanged() {
+void sendStateToSinricIfChanged(bool force) {
+  if (!sinricConnected) return;
+
   auto &dev = light();
+
+  if (force || needFullSync) {
+    dev.sendPowerStateEvent(device_state.power);
+    dev.sendBrightnessEvent(device_state.brightness);
+    dev.sendColorEvent(device_state.color.r, device_state.color.g, device_state.color.b);
+    dev.sendColorTemperatureEvent(device_state.colorTemperature);
+
+    lastReported.power            = device_state.power;
+    lastReported.brightness       = device_state.brightness;
+    lastReported.color            = device_state.color;
+    lastReported.colorTemperature = device_state.colorTemperature;
+
+    needFullSync = false;
+    return;
+  }
 
   if (device_state.power != lastReported.power) {
     dev.sendPowerStateEvent(device_state.power);
@@ -275,7 +297,7 @@ bool onPowerState(const String &deviceId, bool &state) {
       strip.show();
     }
 
-    sendStateToSinricIfChanged();
+    sendStateToSinricIfChanged(); // дифф-репорт (полный будет при reconnect)
   });
   return true;
 }
@@ -446,18 +468,14 @@ void patchStateDeferred(const JsonVariantConst &root) {
     } else {
       // ON -> ON
       if (newState.effectMode == EffectMode::WS2812FX_MODE) {
-        // врубаем эффект, НЕ выключая его при power toggle
         resumeEffectIfNeeded(device_state.brightness);
         if (effectCmd) {
-          // скорость или режим могли поменяться — применим сразу
           fx.setMode(device_state.ws2812fxMode);
           fx.setSpeed(device_state.ws2812fxSpeed);
         }
-        // если brightness меняли — плавно в эффекте
         if (from.brightness != newState.brightness)
           smoothEffectBrightness(from.brightness, newState.brightness);
       } else {
-        // статика
         disableEffectToStatic();
         if (from.brightness != newState.brightness)
           smoothTransitionToBrightness(from.brightness, newState.brightness);
@@ -489,8 +507,17 @@ void setupSinric() {
   myLight.onColor(onColor);
   myLight.onColorTemperature(onColorTemperature);
 
-  SinricPro.onConnected([](){ Serial.println("SinricPro connected"); });
-  SinricPro.onDisconnected([](){ Serial.println("SinricPro disconnected"); });
+  SinricPro.onConnected([](){
+    Serial.println("SinricPro connected");
+    sinricConnected = true;
+    needFullSync = true;
+    sendStateToSinricIfChanged(true);  // форс полная синхронизация
+  });
+
+  SinricPro.onDisconnected([](){
+    Serial.println("SinricPro disconnected");
+    sinricConnected = false;
+  });
 
   SinricPro.begin(APP_KEY, APP_SECRET);
 }
@@ -565,6 +592,9 @@ void setup() {
   device_state.effectMode = EffectMode::STATIC;
   disableEffectToStatic();
   smoothTransitionToBrightness(0, device_state.brightness);
+
+  // если Sinric уже успел соединиться — отправим состояние
+  sendStateToSinricIfChanged(true);
 
   Serial.println("Setup done");
 }
