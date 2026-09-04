@@ -4,6 +4,7 @@
 [![Language](https://img.shields.io/badge/Language-C%2B%2B%20%7C%20Arduino-00979D.svg?logo=arduino&logoColor=white)](#modules)
 [![Status](https://img.shields.io/badge/Status-Legacy%20Firmware-orange.svg)](#background)
 [![Successor](https://img.shields.io/badge/Next%20Gen-Home%20Assistant%20%7C%20ESPHome-41BDF5.svg?logo=homeassistant&logoColor=white)](https://esphome.io/)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/resonaura)
 
 Custom embedded C++ firmware suite for DIY smart home IoT hardware, sensors, and ambient lighting controllers.
 
